@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package fedavg;
+
+service Aggregator {
+  rpc SendSharedUpdate (SharedUpdate) returns (Ack);
+  rpc GetSharedWeights (EmptyRequest) returns (SharedWeights);
+}
+
+message EmptyRequest {}
+
+message SharedUpdate {
+  bytes weights = 1;
+  int32 round = 2;
+  int32 num_samples = 3;
+}
+
+message SharedWeights {
+  bytes weights = 1;
+  int32 round = 2;
+}
+
+message Ack {
+  bool ok = 1;
+}
+
