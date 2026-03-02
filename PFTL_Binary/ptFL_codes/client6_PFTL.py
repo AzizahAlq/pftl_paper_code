@@ -1,0 +1,442 @@
+#!/usr/bin/env python3.10
+# ============================================================
+# client6_PFTL_share_shared_dense_gamma_logs_CLIENT6_PRINT_NO_PLOTS_FIXED.py
+# ============================================================
+# PFTL: Share ONLY shared_dense
+# SAME split + correct class_weight mapping
+# ONE SEED only, and SPLIT_SEED = SEED for train_test_split
+# NO plots
+#
+# Fixes applied (same as the fixed Client5 version):
+#   1) Safe bootstrap: do NOT blend unless server weights are valid [W,b]
+#   2) Strict barrier: send update for server_round=r, then wait until server_round >= r+1
+#   3) Ack handling supports both proto styles: Ack(ok=bool) OR Ack(status/current_round)
+#   4) Adds SUMMARY_CSV: one row per round with local/global macro-f1 (same CSV)
+# ============================================================
+
+# ---- Reproducible seeding (place BEFORE heavy TF imports) ----
+import os, random
+SEED = 190
+SPLIT_SEED = SEED  # always same split seed
+
+os.environ["PYTHONHASHSEED"] = str(SEED)
+os.environ["TF_DETERMINISTIC_OPS"] = "1"
+os.environ["TF_CUDNN_DETERMINISTIC"] = "1"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+
+import numpy as np
+random.seed(SEED); np.random.seed(SEED)
+
+import tensorflow as tf
+tf.random.set_seed(SEED)
+tf.config.threading.set_intra_op_parallelism_threads(1)
+tf.config.threading.set_inter_op_parallelism_threads(1)
+# ---------------------------------------------------------------
+
+import time, csv, pickle, grpc
+from datetime import datetime
+import pandas as pd
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.utils import class_weight
+from sklearn.metrics import (
+    confusion_matrix,
+    accuracy_score,
+    precision_recall_fscore_support,
+    classification_report
+)
+
+import myproto_pb2, myproto_pb2_grpc
+from tensorflow.keras import models, layers, optimizers, initializers
+
+# =========================
+# CONFIG
+# =========================
+SERVER_ADDRESS = "localhost:50051"
+CLIENT_ID      = "client6"
+DATASET_NAME   = "CICIDS-2017"
+
+NUM_ROUNDS   = 8
+BATCH_SIZE   = 256
+LOCAL_EPOCHS = 1
+SLEEP_POLL   = 1.0
+
+GAMMA_GLOBAL = 0.3
+GAMMA_LOCAL  = 1.0 - GAMMA_GLOBAL
+
+SHARED_LAYER_NAME = "shared_dense"
+
+PRIVATE_DIM  = 4
+SHARED_DIM   = 4
+CONV_FILTERS = 4
+LR = 1e-3
+
+DATA_PATH = "/Users/azizahalq/Desktop/PFTL_Binary/Datasets_processed/D3_CICIOT2023/final_cic_ids_clean.csv"
+LABEL_COL = "binary_label"
+
+TEST_SIZE = 0.20
+VAL_SIZE  = 0.10  # of total
+
+# =========================
+# LOGGING (folder)
+# =========================
+METHOD = f"pftl_gamma_{GAMMA_GLOBAL}"
+LOG_DIR = os.path.join("logs", METHOD)
+os.makedirs(LOG_DIR, exist_ok=True)
+
+METRICS_CSV = os.path.join(LOG_DIR, f"{CLIENT_ID}_metrics.csv")
+COMM_CSV    = os.path.join(LOG_DIR, f"{CLIENT_ID}_comm.csv")
+
+# one row per round: local vs global macro-f1 in SAME csv
+SUMMARY_CSV = os.path.join(LOG_DIR, f"{CLIENT_ID}_local_global_macro_f1_by_round.csv")
+SUMMARY_HEADER = ["timestamp","method","dataset","seed","client","round","local_macro_f1","global_macro_f1"]
+
+METRICS_HEADER = [
+    "timestamp","method","dataset","seed","client",
+    "round","phase",
+    "acc",
+    "prec_macro","rec_macro","f1_macro",
+    "prec_weighted","rec_weighted","f1_weighted",
+    "prec0","rec0","f10",
+    "prec1","rec1","f11",
+    "tn","fp","fn","tp"
+]
+
+COMM_HEADER = [
+    "timestamp","method","dataset","seed","client",
+    "round",
+    "bytes_sent","bytes_recv","rtt_sec","train_time_sec",
+    "server_round_after"
+]
+
+def ensure_csv(path, header):
+    if not os.path.exists(path):
+        with open(path, "w", newline="") as f:
+            csv.writer(f).writerow(header)
+
+def append_csv(path, row, header):
+    ensure_csv(path, header)
+    with open(path, "a", newline="") as f:
+        csv.writer(f).writerow(row)
+
+def now_ts():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+# =========================
+# Dataset Loader (SAME split)
+# =========================
+def load_dataset():
+    df = pd.read_csv(DATA_PATH, encoding="ISO-8859-1", low_memory=False)
+    df.columns = df.columns.astype(str).str.strip()
+
+    if LABEL_COL not in df.columns:
+        raise ValueError(f"[{CLIENT_ID}] '{LABEL_COL}' not found. Example cols: {df.columns.tolist()[:25]}")
+
+    y = df[LABEL_COL].astype(int)
+    X = df.drop(columns=[LABEL_COL], errors="ignore")
+
+    # numeric + clean
+    X = X.apply(pd.to_numeric, errors="coerce")
+    X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    # 1) Test = 20% of total
+    X_train_full, X_test, y_train_full, y_test = train_test_split(
+        X, y, test_size=TEST_SIZE, random_state=SPLIT_SEED, stratify=y
+    )
+
+    # 2) Val = 10% of total => 0.125 of train_full (because train_full is 80%)
+    val_frac = VAL_SIZE / (1.0 - TEST_SIZE)  # 0.125
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_train_full, y_train_full, test_size=val_frac, random_state=SPLIT_SEED, stratify=y_train_full
+    )
+
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_val   = scaler.transform(X_val)
+    X_test  = scaler.transform(X_test)
+
+    n_features = X_train.shape[1]
+    X_train = X_train.reshape((-1, n_features, 1)).astype("float32")
+    X_val   = X_val.reshape((-1, n_features, 1)).astype("float32")
+    X_test  = X_test.reshape((-1, n_features, 1)).astype("float32")
+
+    return X_train, X_val, X_test, y_train.values, y_val.values, y_test.values, n_features
+
+# =========================
+# CNN Model
+# =========================
+def build_model(input_steps):
+    ki = initializers.GlorotUniform(seed=SEED)
+    bi = initializers.Zeros()
+    model = models.Sequential([
+        layers.Input(shape=(input_steps, 1)),
+        layers.Conv1D(CONV_FILTERS, 5, activation="relu", padding="same",
+                      kernel_initializer=ki, bias_initializer=bi),
+        layers.MaxPooling1D(pool_size=2),
+        layers.GlobalAveragePooling1D(),
+        layers.Dense(PRIVATE_DIM, activation="relu",
+                     kernel_initializer=ki, bias_initializer=bi),                        # PRIVATE
+        layers.Dense(SHARED_DIM, activation="relu", name=SHARED_LAYER_NAME,
+                     kernel_initializer=ki, bias_initializer=bi),                        # SHARED
+        layers.Dense(1, activation="sigmoid", name="clf",
+                     kernel_initializer=ki, bias_initializer=bi),                         # PRIVATE
+    ])
+    model.compile(
+        optimizer=optimizers.Adam(learning_rate=LR, clipnorm=1.0),
+        loss="binary_crossentropy",
+        metrics=[tf.keras.metrics.BinaryAccuracy(name="accuracy")]
+    )
+    return model
+
+# =========================
+# Shared_dense helpers
+# =========================
+def is_valid_shared(w) -> bool:
+    return isinstance(w, (list, tuple)) and len(w) == 2
+
+def get_shared_layer(model):
+    return model.get_layer(SHARED_LAYER_NAME).get_weights()  # [W,b]
+
+def set_shared_layer(model, w):
+    if not is_valid_shared(w):
+        print(f"[{CLIENT_ID}] WARNING: shared_dense weights invalid format, skipping.")
+        return
+    if any(np.isnan(x).any() for x in w):
+        print(f"[{CLIENT_ID}] WARNING: NaN in shared_dense weights, skipping.")
+        return
+    model.get_layer(SHARED_LAYER_NAME).set_weights(list(w))
+
+def blend_shared(local_w, global_w, gamma_local, gamma_global):
+    if len(local_w) != len(global_w):
+        raise ValueError("local/global shared_dense weights length mismatch")
+    return [gamma_local * l + gamma_global * g for l, g in zip(local_w, global_w)]
+
+# =========================
+# Metrics
+# =========================
+def compute_metrics(model, X, y_true):
+    probs = model.predict(X, verbose=0).reshape(-1)
+    probs = np.nan_to_num(probs, nan=0.5)
+    y_pred = (probs >= 0.5).astype(int)
+
+    acc = float(accuracy_score(y_true, y_pred))
+
+    mp, mr, mf1, _ = precision_recall_fscore_support(y_true, y_pred, average="macro", zero_division=0)
+    wp, wr, wf1, _ = precision_recall_fscore_support(y_true, y_pred, average="weighted", zero_division=0)
+
+    p_cls, r_cls, f_cls, _ = precision_recall_fscore_support(
+        y_true, y_pred, labels=[0, 1], average=None, zero_division=0
+    )
+    prec0, rec0, f10 = float(p_cls[0]), float(r_cls[0]), float(f_cls[0])
+    prec1, rec1, f11 = float(p_cls[1]), float(r_cls[1]), float(f_cls[1])
+
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    tn, fp, fn, tp = [int(x) for x in cm.ravel()]
+
+    return {
+        "y_pred": y_pred,
+        "cm": cm,
+        "acc": acc,
+        "mp": float(mp), "mr": float(mr), "mf1": float(mf1),
+        "wp": float(wp), "wr": float(wr), "wf1": float(wf1),
+        "prec0": prec0, "rec0": rec0, "f10": f10,
+        "prec1": prec1, "rec1": rec1, "f11": f11,
+        "tn": tn, "fp": fp, "fn": fn, "tp": tp,
+    }
+
+def log_metrics(phase, rnd, m):
+    append_csv(METRICS_CSV, [
+        now_ts(), METHOD, DATASET_NAME, SEED, CLIENT_ID,
+        int(rnd), phase,
+        round(m["acc"], 6),
+        round(m["mp"], 6), round(m["mr"], 6), round(m["mf1"], 6),
+        round(m["wp"], 6), round(m["wr"], 6), round(m["wf1"], 6),
+        round(m["prec0"], 6), round(m["rec0"], 6), round(m["f10"], 6),
+        round(m["prec1"], 6), round(m["rec1"], 6), round(m["f11"], 6),
+        int(m["tn"]), int(m["fp"]), int(m["fn"]), int(m["tp"])
+    ], METRICS_HEADER)
+
+# =========================
+# Client
+# =========================
+class PFTLClientSharedDense:
+    def __init__(self):
+        (self.X_train, self.X_val, self.X_test,
+         self.y_train, self.y_val, self.y_test,
+         self.n_features) = load_dataset()
+
+        classes = np.unique(self.y_train)
+        cw = class_weight.compute_class_weight(class_weight="balanced", classes=classes, y=self.y_train)
+        self.class_weights = {int(c): float(w) for c, w in zip(classes, cw)}
+        print(f"[{CLIENT_ID}] class_weight = {self.class_weights}")
+
+        self.model = build_model(self.n_features)
+
+        self.current_round = 0
+        self.channel = grpc.insecure_channel(SERVER_ADDRESS)
+        self.stub = myproto_pb2_grpc.AggregatorStub(self.channel)
+
+        ensure_csv(METRICS_CSV, METRICS_HEADER)
+        ensure_csv(COMM_CSV, COMM_HEADER)
+        ensure_csv(SUMMARY_CSV, SUMMARY_HEADER)
+
+        # Safe bootstrap: blend ONLY if server weights are valid [W,b]
+        try:
+            resp = self.stub.GetSharedWeights(myproto_pb2.EmptyRequest(), metadata=[("client_id", CLIENT_ID)])
+            self.current_round = int(getattr(resp, "round", 0))
+
+            srv_w = None
+            if getattr(resp, "weights", None):
+                try:
+                    srv_w = pickle.loads(resp.weights)
+                except Exception:
+                    srv_w = None
+
+            if is_valid_shared(srv_w):
+                local_w = get_shared_layer(self.model)
+                blended = blend_shared(local_w, srv_w, GAMMA_LOCAL, GAMMA_GLOBAL)
+                set_shared_layer(self.model, blended)
+
+            print(f"[{CLIENT_ID}] Aggregator reachable (server_round={self.current_round})")
+        except Exception as e:
+            print(f"[{CLIENT_ID}] Bootstrap failed: {e}")
+
+    def _ack_ok(self, ack) -> bool:
+        # Proto style A: Ack(ok=bool)
+        if hasattr(ack, "ok"):
+            return bool(ack.ok)
+        # Proto style B: Ack(status="OK/WAITING/ERROR", current_round=..)
+        if hasattr(ack, "status"):
+            s = str(ack.status).upper()
+            return s.startswith("OK") or s.startswith("WAIT")
+        return True
+
+    def _pull_global(self):
+        resp = self.stub.GetSharedWeights(myproto_pb2.EmptyRequest(), metadata=[("client_id", CLIENT_ID)])
+        bytes_recv = len(resp.weights) if getattr(resp, "weights", None) else 0
+
+        w = None
+        if getattr(resp, "weights", None) and bytes_recv > 0:
+            try:
+                w = pickle.loads(resp.weights)
+            except Exception:
+                w = None
+
+        return w, int(getattr(resp, "round", 0)), int(bytes_recv)
+
+    def run(self):
+        for loop_i in range(NUM_ROUNDS):
+            # strict: r is the round we send on
+            server_round_before = int(self.current_round)
+            print(f"\n[{CLIENT_ID}] ===== Round {loop_i+1}/{NUM_ROUNDS} (server_round={server_round_before}) =====")
+
+            t_train0 = time.perf_counter()
+            self.model.fit(
+                self.X_train, self.y_train,
+                epochs=LOCAL_EPOCHS, batch_size=BATCH_SIZE, verbose=0,
+                shuffle=True,
+                class_weight=self.class_weights,
+                validation_data=(self.X_val, self.y_val)
+            )
+            train_time = time.perf_counter() - t_train0
+
+            m_local = compute_metrics(self.model, self.X_test, self.y_test)
+            log_metrics("local_after_training", server_round_before, m_local)
+
+            payload = pickle.dumps(get_shared_layer(self.model))
+            bytes_sent = len(payload)
+            t0 = time.perf_counter()
+
+            ack = self.stub.SendSharedUpdate(
+                myproto_pb2.SharedUpdate(
+                    weights=payload,
+                    round=int(server_round_before),
+                    num_samples=int(self.X_train.shape[0])
+                ),
+                metadata=[("client_id", CLIENT_ID)]
+            )
+
+            if not self._ack_ok(ack):
+                print(f"[{CLIENT_ID}] Update rejected. Resyncing round...")
+                try:
+                    glob_w, r, _ = self._pull_global()
+                    self.current_round = int(r)
+                    if is_valid_shared(glob_w):
+                        local_w = get_shared_layer(self.model)
+                        blended = blend_shared(local_w, glob_w, GAMMA_LOCAL, GAMMA_GLOBAL)
+                        set_shared_layer(self.model, blended)
+                except Exception as e:
+                    print(f"[{CLIENT_ID}] Resync failed: {e}")
+                continue
+
+            # STRICT BARRIER: wait until server_round >= r+1
+            target = server_round_before + 1
+            while True:
+                time.sleep(SLEEP_POLL)
+                glob_w, r_check, bytes_recv = self._pull_global()
+
+                if int(r_check) >= target:
+                    rtt = time.perf_counter() - t0
+
+                    if is_valid_shared(glob_w):
+                        local_w = get_shared_layer(self.model)
+                        blended = blend_shared(local_w, glob_w, GAMMA_LOCAL, GAMMA_GLOBAL)
+                        set_shared_layer(self.model, blended)
+                    else:
+                        print(f"[{CLIENT_ID}] WARNING: invalid server global at r={r_check}; keeping local shared.")
+
+                    self.current_round = int(r_check)
+
+                    m_global = compute_metrics(self.model, self.X_test, self.y_test)
+                    log_metrics("global_after_sync", self.current_round, m_global)
+
+                    # one-row summary (macro-f1 only)
+                    append_csv(SUMMARY_CSV, [
+                        now_ts(), METHOD, DATASET_NAME, SEED, CLIENT_ID,
+                        int(self.current_round),
+                        round(float(m_local["mf1"]), 6),
+                        round(float(m_global["mf1"]), 6),
+                    ], SUMMARY_HEADER)
+
+                    append_csv(COMM_CSV, [
+                        now_ts(), METHOD, DATASET_NAME, SEED, CLIENT_ID,
+                        int(server_round_before),
+                        int(bytes_sent), int(bytes_recv),
+                        round(rtt, 6), round(train_time, 6),
+                        int(self.current_round)
+                    ], COMM_HEADER)
+
+                    print(f"[{CLIENT_ID}] Barrier passed -> server_round={self.current_round}")
+                    break
+                else:
+                    print(f"[{CLIENT_ID}] Waiting server... (server_round={r_check}, target={target})")
+
+        # FINAL (Client6-style print)
+        m = compute_metrics(self.model, self.X_test, self.y_test)
+        log_metrics("final", self.current_round, m)
+
+        print(f"\n[{CLIENT_ID}] ===== FINAL TEST EVALUATION =====")
+        print(f"\nAccuracy        : {m['acc']:.6f}")
+        print(f"Macro-Precision : {m['mp']:.6f}")
+        print(f"Macro-Recall    : {m['mr']:.6f}")
+        print(f"Macro-F1        : {m['mf1']:.6f}")
+
+        print("\n===== WEIGHTED (support-weighted) METRICS =====")
+        print(f"Weighted-Precision : {m['wp']:.6f}")
+        print(f"Weighted-Recall    : {m['wr']:.6f}")
+        print(f"Weighted-F1        : {m['wf1']:.6f}")
+
+        print("\n==== Classification Report ====")
+        print(classification_report(self.y_test, m["y_pred"], zero_division=0))
+
+        print("\n==== Confusion Matrix ====")
+        print(m["cm"])
+
+        print("\n===== SAVED (CSV ONLY) =====")
+        print("Metrics CSV:", METRICS_CSV)
+        print("Comm CSV   :", COMM_CSV)
+        print("Summary CSV:", SUMMARY_CSV)
+
+if __name__ == "__main__":
+    PFTLClientSharedDense().run()
