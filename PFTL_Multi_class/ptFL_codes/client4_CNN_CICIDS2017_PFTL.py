@@ -168,7 +168,7 @@ def log_stage_row(seed, round_id, stage,
             now_str()
         ])
 
-# ✅ MUST MATCH STANDALONE CLIENT4 MODEL EXACTLY
+# MUST MATCH STANDALONE CLIENT4 MODEL EXACTLY
 def build_cnn(input_shape, num_classes):
     inp = layers.Input(shape=input_shape)
 
@@ -269,7 +269,7 @@ class PTFLClient4_LocalFirst_StrictBarrier:
         print("Top 15 label counts:")
         print(pd.Series(y_raw).value_counts().head(15))
 
-        # ✅ unified split rule
+        # unified split rule
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=TEST_SIZE, random_state=SEED, stratify=y
         )
@@ -489,7 +489,7 @@ class PTFLClient4_LocalFirst_StrictBarrier:
                 sent_type
             )
 
-            print(f"[{CLIENT_ID}] ✅ Barrier passed: {server_round_before} -> {self.current_round} (wait={waited_sec:.2f}s)")
+            print(f"[{CLIENT_ID}] Barrier passed: {server_round_before} -> {self.current_round} (wait={waited_sec:.2f}s)")
 
         # FINAL TEST
         print(f"\n[{CLIENT_ID}] ===== FINAL TEST EVALUATION =====")
