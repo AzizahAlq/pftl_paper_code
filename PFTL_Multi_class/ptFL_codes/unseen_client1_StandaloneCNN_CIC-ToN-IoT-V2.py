@@ -2,22 +2,8 @@
 # ============================================================
 # Standalone_CNN_CLIENT1_TON_IOT_MATCH_PTFL_FIXED_WITH_CM_PLOT.py
 # ============================================================
-# Standalone baseline for Client1 (CIC-ToN-IoT), matching your PTFL style.
+# Standalone baseline for Client1 (CIC-ToN-IoT), matching PTFL style.
 #
-# Includes:
-#  - Deterministic seeding
-#  - Same cleaning logic
-#  - Same split logic (70/15/15 using TEST=0.15 and VAL_FROM_TRAIN=0.15/(1-TEST))
-#  - Same model naming: private_dense / shared_dense
-#  - Adam + clipnorm=1.0
-#  - Correct class_weight mapping
-#  - Epoch CSV logger (val macro/weighted)
-#  - Confusion matrix saved:
-#       CSV + PNG + PDF + normalized-by-true PNG
-#
-# IMPORTANT: CM colors are tuned to be LIGHTER (like your example):
-#  - cmap="Blues"
-#  - vmax_scale > 1 makes max cell less dark
 # ============================================================
 
 import os
