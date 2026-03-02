@@ -41,7 +41,7 @@ OUT_DIR = f"/Users/azizahalq/Desktop/PFTL_project3/ptfl_logs/{CLIENT_ID}_intelli
 os.makedirs(OUT_DIR, exist_ok=True)
 CURVE_CSV = os.path.join(OUT_DIR, f"{CLIENT_ID}_local_vs_global_curve.csv")
 
-# ✅ unified split rule
+# unified split rule
 TEST_SIZE = 0.15
 VAL_SIZE_FROM_TRAIN = 0.15 / (1.0 - TEST_SIZE)  # 0.17647058823529413
 
@@ -130,7 +130,7 @@ class Client6IntelligentFixed:
 
         X = X_df.values.astype(np.float32)
 
-        # ✅ unified split rule
+        # unified split rule
         X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=TEST_SIZE, random_state=SEED, stratify=y)
         X_tr, X_va, y_tr, y_va = train_test_split(X_tr, y_tr, test_size=VAL_SIZE_FROM_TRAIN, random_state=SEED, stratify=y_tr)
 
