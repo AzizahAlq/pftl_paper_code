@@ -72,7 +72,7 @@ os.makedirs(OUT_DIR, exist_ok=True)
 gamma = (1, 0)     # (local, global)
 EPOCHS = 20
 BATCH  = 1024
-LR     = 1e-4          # ✅ safer for transfer
+LR     = 1e-4          # safer for transfer
 
 # PTFL matching splits (70/15/15)
 TEST_SIZE = 0.15
@@ -139,7 +139,7 @@ def plot_confusion_matrix_clean_multiclass(cm, labels, outpath):
         cmap="Blues",
         square=True,
         annot=False,         # multiclass: keep clean
-        linewidths=0,        # ✅ no inner borders
+        linewidths=0,        # no inner borders
         xticklabels=labels,
         yticklabels=labels,
         cbar=True,
@@ -152,7 +152,7 @@ def plot_confusion_matrix_clean_multiclass(cm, labels, outpath):
     ax.tick_params(axis="x", rotation=90, labelsize=8)
     ax.tick_params(axis="y", rotation=0,  labelsize=8)
 
-    # ✅ outer black border only
+    # outer black border only
     for spine in ax.spines.values():
         spine.set_visible(True)
         spine.set_color("black")
@@ -255,7 +255,7 @@ def main():
     y = le.fit_transform(y_raw).astype(int)
     class_names = list(le.classes_)
     num_classes = int(len(class_names))
-    labels_all = np.arange(num_classes)  # ✅ stable labels for report
+    labels_all = np.arange(num_classes)  # stable labels for report
     print("Num classes:", num_classes)
 
     # ---------- splits 70/15/15 ----------
@@ -333,7 +333,7 @@ def main():
     print(f"Train time (sec): {train_time:.2f}")
 
     print("\n==== Classification Report ====")
-    # ✅ FIX: force same #labels as target_names
+
     print(classification_report(
         y_test, y_hat,
         labels=labels_all,
