@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package myproto;
+
+// ========== Message Definitions ==========
+
+message EmptyRequest {}
+
+message SharedUpdate {
+    bytes weights = 1;
+    int32 round = 2;
+    int32 num_samples = 3;
+}
+
+message SharedResponse {
+    bytes weights = 1;
+    int32 round = 2;
+}
+
+message Ack {
+    string status = 1;
+    int32 current_round = 2;
+}
+
+// ========== Service Definition ==========
+
+service Aggregator {
+    rpc SendSharedUpdate(SharedUpdate) returns (Ack);
+    rpc GetSharedWeights(EmptyRequest) returns (SharedResponse);
+}
